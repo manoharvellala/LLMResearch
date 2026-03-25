@@ -241,7 +241,7 @@ def eager_attention_forward(
             sine_wave = sine_wave.view(1, 1, 1, -1).expand_as(middle_part)
 
             amplification_value = getattr(module.config, "amplification_value", 10.0)
-            middle_part = middle_part + sine_wave * amplification_value  # additive bias
+            middle_part = sine_wave * amplification_value  # replace scores (matches original)
             attn_weights = torch.cat((start_part, middle_part, rest_part), dim=-1)
     # --- End System Prompt Attention Amplification ---
 
@@ -260,7 +260,14 @@ def eager_attention_forward(
             amp_val   = getattr(module.config, "amplification_value", 0.0)
             sp_len    = getattr(module.config, "system_prompt_len", None)
             tok_labels = getattr(module.config, "viz_token_labels", None)
-            cfg_label  = f"amp{amp_val}" if sp_len is not None else "baseline"
+            sp_embeds_active = getattr(module.config, "system_prompt_embeds", None) is not None
+            inject_repeat = getattr(module.config, "inject_repeat", 0)
+            if sp_len is not None:
+                cfg_label = f"amp{amp_val}"
+            elif sp_embeds_active:
+                cfg_label = f"inject_x{inject_repeat}"
+            else:
+                cfg_label = "baseline"
 
             # How many positions to show — enough to cover the whole system prompt
             # plus a window into the user message.
@@ -293,7 +300,7 @@ def eager_attention_forward(
                 ax.legend(loc="upper right", fontsize=9)
 
             ax.set_title(f"Post-softmax Attention · Layer 27 · Head 0 · {cfg_label}", fontsize=13)
-            filename = f"/workspace/attn_layer27_{cfg_label}.png"
+            filename = f"/workspace/transformers/research/attn_layer27_{cfg_label}.png"
             plt.tight_layout()
             plt.savefig(filename, dpi=100)
             plt.close()
@@ -517,33 +524,16 @@ class LlamaModel(LlamaPreTrainedModel):
         inject_repeat  = getattr(self.config, "inject_repeat", 30)       # match original: for i in range(30)
         is_prefill     = inputs_embeds.shape[1] > 1
 
-        # --- Debug: print embedding stats once per prefill ---
-        if is_prefill and sp_embeds is not None:
-            print(f"\n[DEBUG] Input prompt embeddings (inputs_embeds):")
-            print(f"  shape : {inputs_embeds.shape}")
-            print(f"  dtype : {inputs_embeds.dtype}")
-            print(f"  norm  : {inputs_embeds.norm().item():.4f}")
-            print(f"  min   : {inputs_embeds.min().item():.4f}  max: {inputs_embeds.max().item():.4f}")
-            print(f"\n[DEBUG] System prompt embeddings (sp_embeds):")
-            print(f"  shape : {sp_embeds.shape}")
-            print(f"  dtype : {sp_embeds.dtype}")
-            print(f"  norm  : {sp_embeds.norm().item():.4f}")
-            print(f"  min   : {sp_embeds.min().item():.4f}  max: {sp_embeds.max().item():.4f}")
-            print(f"\n[DEBUG] Injection config: inject_from_layer={inject_from}, inject_repeat={inject_repeat}")
-            print(f"  → will inject at layers {inject_from}–{self.config.num_hidden_layers - 1} "
-                  f"({self.config.num_hidden_layers - inject_from} layers total)\n")
-        # --- End Debug ---
-
-        # Take first 100 tokens of inputs_embeds as the injection signal, padded to full seq len
+        # Pad system prompt embeddings to match hidden_states seq length (matches original)
         if sp_embeds is not None and is_prefill:
-            inject_len = min(100, inputs_embeds.shape[1])
-            inject_signal = inputs_embeds[:, :inject_len, :]
+            sp_len = sp_embeds.shape[1]
             full_len = inputs_embeds.shape[1]
-            padded = torch.nn.functional.pad(
-                inject_signal, (0, 0, 0, full_len - inject_len)
-            ).to(inputs_embeds.dtype)
-            print(f"[DEBUG] inject_signal: first {inject_len} tokens of inputs_embeds, "
-                  f"norm={inject_signal.norm().item():.4f}, padded shape={padded.shape}")
+            if sp_len < full_len:
+                padded = torch.nn.functional.pad(
+                    sp_embeds, (0, 0, 0, full_len - sp_len), value=0
+                ).to(inputs_embeds.dtype)
+            else:
+                padded = sp_embeds[:, :full_len, :].to(inputs_embeds.dtype)
 
         for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             # --- System Prompt Embedding Injection (pre-layer, matches legacy) ---
@@ -552,14 +542,9 @@ class LlamaModel(LlamaPreTrainedModel):
             #       for i in range(30):
             #           h = h + systemPromptEmbeddings
             if sp_embeds is not None and layer_idx >= inject_from and is_prefill:
-                if layer_idx == inject_from:
-                    print(f"[DEBUG] First injection at layer {layer_idx}:")
-                    print(f"  hidden_states before inject: norm={hidden_states.norm().item():.4f}")
                 # Add inject_repeat times, exactly like: for i in range(N): h = h + systemPromptEmbeddings
                 for _ in range(inject_repeat):
                     hidden_states = hidden_states + padded
-                if layer_idx == inject_from:
-                    print(f"  hidden_states after inject : norm={hidden_states.norm().item():.4f}\n")
             # --- End System Prompt Embedding Injection ---
 
             hidden_states = decoder_layer(

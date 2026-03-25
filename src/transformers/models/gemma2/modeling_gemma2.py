@@ -21,6 +21,11 @@
 from collections.abc import Callable
 from typing import Optional
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import seaborn as sns
+
 import torch
 import torch.nn as nn
 
@@ -221,6 +226,54 @@ def eager_attention_forward(
     # upcast attention to fp32
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+
+    # --- Attention Visualization (research) ---
+    query_len = query.shape[2]
+    viz_layer = 27  # visualize at this layer
+    if query_len > 1 and module.layer_idx == viz_layer and not getattr(module.config, "viz_saved", False):
+        try:
+            layer_reprs_active = getattr(module.config, "system_prompt_layer_reprs", None) is not None
+            sp_embeds_active = getattr(module.config, "system_prompt_embeds", None) is not None
+            inject_repeat = getattr(module.config, "inject_repeat", 0)
+            inject_scale = getattr(module.config, "inject_scale", 1.0)
+            if layer_reprs_active:
+                cfg_label = f"layerrepr_s{inject_scale}_r{inject_repeat}"
+            elif sp_embeds_active:
+                cfg_label = f"inject_x{inject_repeat}"
+            else:
+                cfg_label = "baseline"
+
+            N = min(80, query_len, attn_weights.shape[-1])
+            w_np = attn_weights[0, 0, :N, :N].float().cpu().detach().numpy()
+
+            tok_labels = getattr(module.config, "viz_token_labels", None)
+            if tok_labels is not None and len(tok_labels) >= N:
+                ticks = [repr(tok_labels[i])[1:-1] for i in range(N)]
+            else:
+                ticks = [str(i) for i in range(N)]
+
+            fig, ax = plt.subplots(figsize=(28, 24))
+            sns.heatmap(
+                w_np, ax=ax, cmap="viridis",
+                xticklabels=ticks, yticklabels=ticks,
+                cbar_kws={"shrink": 0.5},
+            )
+            ax.set_xlabel("Key tokens →", fontsize=11)
+            ax.set_ylabel("Query tokens →", fontsize=11)
+            ax.tick_params(axis="x", labelsize=7, rotation=90)
+            ax.tick_params(axis="y", labelsize=7, rotation=0)
+            ax.set_title(f"Post-softmax Attention · Gemma2 Layer {viz_layer} · Head 0 · {cfg_label}", fontsize=13)
+            filename = f"/workspace/transformers/research/gemma2_attn_layer{viz_layer}_{cfg_label}.png"
+            plt.tight_layout()
+            plt.savefig(filename, dpi=100)
+            plt.close()
+            module.config.viz_saved = True
+            print(f"[viz] Saved {filename}")
+        except Exception as _viz_err:
+            print(f"[viz] Error: {_viz_err}")
+            plt.close("all")
+    # --- End Attention Visualization ---
+
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
     return attn_output, attn_weights
@@ -455,7 +508,43 @@ class Gemma2Model(Gemma2PreTrainedModel):
         normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype)
         hidden_states = hidden_states * normalizer
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        # ── System Prompt Embedding Injection (research) ──────────────────
+        # Two modes:
+        #   1) Layer-specific reprs (preferred): inject hidden states captured from a
+        #      clean forward pass at each layer. These are in the correct representational
+        #      space and magnitude for their target depth.
+        #   2) Raw embeddings (legacy): inject scaled token embeddings (layer-0 space).
+        sp_layer_reprs = getattr(self.config, "system_prompt_layer_reprs", None)
+        sp_embeds      = getattr(self.config, "system_prompt_embeds", None)
+        inject_from    = getattr(self.config, "inject_from_layer", 17)
+        inject_repeat  = getattr(self.config, "inject_repeat", 1)
+        inject_scale   = getattr(self.config, "inject_scale", 0.1)
+        is_prefill     = inputs_embeds.shape[1] > 1
+        use_layer_reprs = sp_layer_reprs is not None
+        inject_active  = (use_layer_reprs or sp_embeds is not None) and is_prefill
+
+        full_len = inputs_embeds.shape[1]
+
+        # Pre-compute padded injection for legacy raw-embedding mode
+        if sp_embeds is not None and not use_layer_reprs and is_prefill:
+            normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=sp_embeds.dtype)
+            scaled_embeds = sp_embeds * normalizer * inject_scale
+            sp_len = scaled_embeds.shape[1]
+            if sp_len < full_len:
+                padded = torch.nn.functional.pad(
+                    scaled_embeds, (0, 0, 0, full_len - sp_len), value=0
+                ).to(inputs_embeds.dtype)
+            else:
+                padded = scaled_embeds[:, :full_len, :].to(inputs_embeds.dtype)
+
+        # For layer-specific mode, get sp_len from the first repr
+        if use_layer_reprs and is_prefill:
+            first_repr = next(iter(sp_layer_reprs.values()))
+            sp_len = first_repr.shape[1]
+
+        _debug_inject = getattr(self.config, "_debug_inject", True)
+
+        for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask_mapping[decoder_layer.attention_type],
@@ -465,6 +554,45 @@ class Gemma2Model(Gemma2PreTrainedModel):
                 cache_position=cache_position,
                 **kwargs,
             )
+            # --- System Prompt Embedding Injection (POST-layer) ---
+            if inject_active and layer_idx >= inject_from:
+                if use_layer_reprs and layer_idx in sp_layer_reprs:
+                    # Layer-specific: representations already in correct space
+                    layer_repr = sp_layer_reprs[layer_idx]
+                    repr_sp_len = layer_repr.shape[1]
+                    if repr_sp_len < full_len:
+                        padded = torch.nn.functional.pad(
+                            layer_repr * inject_scale, (0, 0, 0, full_len - repr_sp_len), value=0
+                        ).to(hidden_states.dtype)
+                    else:
+                        padded = (layer_repr[:, :full_len, :] * inject_scale).to(hidden_states.dtype)
+
+                if _debug_inject:
+                    sp_norm_before = hidden_states[0, :sp_len, :].float().norm().item()
+                    non_sp_norm_before = hidden_states[0, sp_len:, :].float().norm().item()
+                    padded_sp_norm = padded[0, :sp_len, :].float().norm().item()
+                    padded_non_sp_norm = padded[0, sp_len:, :].float().norm().item()
+
+                for _ in range(inject_repeat):
+                    hidden_states = hidden_states + padded
+
+                if _debug_inject:
+                    sp_norm_after = hidden_states[0, :sp_len, :].float().norm().item()
+                    non_sp_norm_after = hidden_states[0, sp_len:, :].float().norm().item()
+                    mode = "layer-repr" if use_layer_reprs else "raw-embed"
+                    print(f"  [inject-post:{mode}] layer {layer_idx}: "
+                          f"sp norm {sp_norm_before:.1f} → {sp_norm_after:.1f} "
+                          f"(+{sp_norm_after - sp_norm_before:.1f})  |  "
+                          f"non-sp norm {non_sp_norm_before:.1f} → {non_sp_norm_after:.1f} "
+                          f"(+{non_sp_norm_after - non_sp_norm_before:.1f})  |  "
+                          f"inject_norm={padded_sp_norm:.1f}")
+                    if layer_idx == inject_from:
+                        print(f"  [inject-post] mode={mode}, sp_len={sp_len}, "
+                              f"full_len={full_len}, repeat={inject_repeat}, "
+                              f"scale={inject_scale}")
+                    if layer_idx == self.config.num_hidden_layers - 1:
+                        self.config._debug_inject = False
+            # --- End System Prompt Embedding Injection ---
 
         hidden_states = self.norm(hidden_states)
 
