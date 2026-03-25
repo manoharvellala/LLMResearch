@@ -16,8 +16,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 from collections.abc import Callable
 from typing import Optional
+import matplotlib
+matplotlib.use("Agg")  # non-interactive backend — no display required
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 import torch
 from torch import nn
@@ -210,11 +215,95 @@ def eager_attention_forward(
     value_states = repeat_kv(value, module.num_key_value_groups)
 
     attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+
+    # --- System Prompt Attention Amplification ---
+    # In later layers (> 25), boost attention scores for system prompt token positions
+    # using a sine wave envelope. This reinforces system prompt context that decays
+    # in deeper layers, improving instruction-following compliance.
+    # Activate only during prefill (query_len > 1) to match original research behaviour.
+    system_prompt_len = getattr(module.config, "system_prompt_len", None)
+    layer_threshold  = getattr(module.config, "layer_threshold", 25)
+    query_len = query.shape[2]
+    if system_prompt_len is not None and module.layer_idx > layer_threshold and query_len > 1:
+        start = 2  # skip BOS / header tokens
+        end = min(100, attn_weights.shape[-1])
+        if end > start:
+            start_part = attn_weights[:, :, :, :start]
+            middle_part = attn_weights[:, :, :, start:end]
+            rest_part = attn_weights[:, :, :, end:]
+
+            # Sine envelope over [0, π] → peaks at the centre of the system prompt
+            seg_len = middle_part.size(-1)
+            sine_wave = torch.sin(
+                torch.linspace(0, math.pi, seg_len, device=attn_weights.device, dtype=attn_weights.dtype)
+            )
+            sine_wave = (sine_wave + 1) / 2  # rescale to [0, 1]
+            sine_wave = sine_wave.view(1, 1, 1, -1).expand_as(middle_part)
+
+            amplification_value = getattr(module.config, "amplification_value", 10.0)
+            middle_part = middle_part + sine_wave * amplification_value  # additive bias
+            attn_weights = torch.cat((start_part, middle_part, rest_part), dim=-1)
+    # --- End System Prompt Attention Amplification ---
+
     if attention_mask is not None:
         attn_weights = attn_weights + attention_mask
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+
+    # --- Attention Visualization ---
+    # Save ONE heatmap per config at layer 27, first prefill sample only.
+    # Axes are labelled with the actual decoded token strings so you can see
+    # exactly which positions belong to the system prompt vs user message.
+    if query_len > 1 and module.layer_idx == 27 and not getattr(module.config, "viz_saved", False):
+        try:
+            amp_val   = getattr(module.config, "amplification_value", 0.0)
+            sp_len    = getattr(module.config, "system_prompt_len", None)
+            tok_labels = getattr(module.config, "viz_token_labels", None)
+            cfg_label  = f"amp{amp_val}" if sp_len is not None else "baseline"
+
+            # How many positions to show — enough to cover the whole system prompt
+            # plus a window into the user message.
+            N = min(80, query_len, attn_weights.shape[-1])
+
+            # attn_weights shape: (batch, heads, query_len, key_len)
+            w_np = attn_weights[0, 0, :N, :N].float().cpu().detach().numpy()
+
+            # Build tick labels: use decoded tokens if available, else position numbers
+            if tok_labels is not None and len(tok_labels) >= N:
+                ticks = [repr(tok_labels[i])[1:-1] for i in range(N)]  # strip outer quotes
+            else:
+                ticks = [str(i) for i in range(N)]
+
+            fig, ax = plt.subplots(figsize=(28, 24))
+            sns.heatmap(
+                w_np, ax=ax, cmap="viridis",
+                xticklabels=ticks, yticklabels=ticks,
+                cbar_kws={"shrink": 0.5},
+            )
+            ax.set_xlabel("Key tokens →", fontsize=11)
+            ax.set_ylabel("Query tokens →", fontsize=11)
+            ax.tick_params(axis="x", labelsize=7, rotation=90)
+            ax.tick_params(axis="y", labelsize=7, rotation=0)
+
+            # Draw a line marking the end of the system prompt
+            if sp_len is not None and sp_len < N:
+                ax.axvline(x=sp_len, color="red", linewidth=2, linestyle="--", label=f"sys-prompt end (tok {sp_len})")
+                ax.axhline(y=sp_len, color="red", linewidth=2, linestyle="--")
+                ax.legend(loc="upper right", fontsize=9)
+
+            ax.set_title(f"Post-softmax Attention · Layer 27 · Head 0 · {cfg_label}", fontsize=13)
+            filename = f"/workspace/attn_layer27_{cfg_label}.png"
+            plt.tight_layout()
+            plt.savefig(filename, dpi=100)
+            plt.close()
+            module.config.viz_saved = True
+            print(f"[viz] Saved {filename}")
+        except Exception as _viz_err:
+            print(f"[viz] Error: {_viz_err}")
+            plt.close("all")
+    # --- End Attention Visualization ---
+
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
@@ -418,7 +507,61 @@ class LlamaModel(LlamaPreTrainedModel):
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids=position_ids)
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+        # --- System Prompt Embedding Injection ---
+        # Before each qualifying layer, re-inject the raw system prompt token embeddings
+        # into the hidden states at the system-prompt positions.  This "reminds" the model
+        # of the system prompt in deeper layers where that context tends to fade, countering
+        # adversarial long-context attacks that dilute the system prompt.
+        sp_embeds      = getattr(self.config, "system_prompt_embeds", None)
+        inject_from    = getattr(self.config, "inject_from_layer", 17)   # default: last 15 of 32
+        inject_repeat  = getattr(self.config, "inject_repeat", 30)       # match original: for i in range(30)
+        is_prefill     = inputs_embeds.shape[1] > 1
+
+        # --- Debug: print embedding stats once per prefill ---
+        if is_prefill and sp_embeds is not None:
+            print(f"\n[DEBUG] Input prompt embeddings (inputs_embeds):")
+            print(f"  shape : {inputs_embeds.shape}")
+            print(f"  dtype : {inputs_embeds.dtype}")
+            print(f"  norm  : {inputs_embeds.norm().item():.4f}")
+            print(f"  min   : {inputs_embeds.min().item():.4f}  max: {inputs_embeds.max().item():.4f}")
+            print(f"\n[DEBUG] System prompt embeddings (sp_embeds):")
+            print(f"  shape : {sp_embeds.shape}")
+            print(f"  dtype : {sp_embeds.dtype}")
+            print(f"  norm  : {sp_embeds.norm().item():.4f}")
+            print(f"  min   : {sp_embeds.min().item():.4f}  max: {sp_embeds.max().item():.4f}")
+            print(f"\n[DEBUG] Injection config: inject_from_layer={inject_from}, inject_repeat={inject_repeat}")
+            print(f"  → will inject at layers {inject_from}–{self.config.num_hidden_layers - 1} "
+                  f"({self.config.num_hidden_layers - inject_from} layers total)\n")
+        # --- End Debug ---
+
+        # Take first 100 tokens of inputs_embeds as the injection signal, padded to full seq len
+        if sp_embeds is not None and is_prefill:
+            inject_len = min(100, inputs_embeds.shape[1])
+            inject_signal = inputs_embeds[:, :inject_len, :]
+            full_len = inputs_embeds.shape[1]
+            padded = torch.nn.functional.pad(
+                inject_signal, (0, 0, 0, full_len - inject_len)
+            ).to(inputs_embeds.dtype)
+            print(f"[DEBUG] inject_signal: first {inject_len} tokens of inputs_embeds, "
+                  f"norm={inject_signal.norm().item():.4f}, padded shape={padded.shape}")
+
+        for layer_idx, decoder_layer in enumerate(self.layers[: self.config.num_hidden_layers]):
+            # --- System Prompt Embedding Injection (pre-layer, matches legacy) ---
+            # Mirrors legacy exactly:
+            #   if counter > 14:
+            #       for i in range(30):
+            #           h = h + systemPromptEmbeddings
+            if sp_embeds is not None and layer_idx >= inject_from and is_prefill:
+                if layer_idx == inject_from:
+                    print(f"[DEBUG] First injection at layer {layer_idx}:")
+                    print(f"  hidden_states before inject: norm={hidden_states.norm().item():.4f}")
+                # Add inject_repeat times, exactly like: for i in range(N): h = h + systemPromptEmbeddings
+                for _ in range(inject_repeat):
+                    hidden_states = hidden_states + padded
+                if layer_idx == inject_from:
+                    print(f"  hidden_states after inject : norm={hidden_states.norm().item():.4f}\n")
+            # --- End System Prompt Embedding Injection ---
+
             hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
